@@ -1,0 +1,406 @@
+package SD_Tech.LeetAI.Controller;
+
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import SD_Tech.LeetAI.DTO.SubmissionDetailsDTO;
+import SD_Tech.LeetAI.DTO.SubmissionRequestDTO;
+import SD_Tech.LeetAI.DTO.TestCaseResultDTO;
+import SD_Tech.LeetAI.Entity.Problem;
+import SD_Tech.LeetAI.Entity.Submission;
+import SD_Tech.LeetAI.Entity.SubmissionTestCaseResult;
+import SD_Tech.LeetAI.Entity.TestCase;
+import SD_Tech.LeetAI.Entity.User;
+import SD_Tech.LeetAI.Repository.ProblemRepository;
+import SD_Tech.LeetAI.Repository.SubmissionRepository;
+import SD_Tech.LeetAI.Repository.TestCaseRepository;
+import SD_Tech.LeetAI.Repository.UserRepository;
+import SD_Tech.LeetAI.Service.GeminiService;
+
+@RestController
+@RequestMapping("/api/submissions")
+@Transactional(readOnly = true)
+public class SubmissionController {
+
+    @Autowired
+    private SubmissionRepository submissionRepository;
+
+    @Autowired
+    private TestCaseRepository testCaseRepository;
+
+    @Autowired
+    private GeminiService geminiService;
+    
+    @Autowired
+    private ProblemRepository problemRepository;
+    
+    @Autowired
+    private UserRepository userRepository;
+    
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @PostMapping
+    @Transactional(readOnly = false)
+    public ResponseEntity<?> submitCode(@RequestBody SubmissionRequestDTO submissionRequest) {
+        try {
+            if (submissionRequest.getCode() == null || submissionRequest.getCode().trim().isEmpty()) {
+                return ResponseEntity.badRequest().body("Code cannot be empty");
+            }
+            
+            if (submissionRequest.getProblemId() == null) {
+                return ResponseEntity.badRequest().body("Problem ID is required");
+            }
+            
+            if (submissionRequest.getUserId() == null) {
+                return ResponseEntity.badRequest().body("User ID is required");
+            }
+            
+            Problem problem = problemRepository.findById(submissionRequest.getProblemId())
+                    .orElseThrow(() -> new IllegalArgumentException("Problem not found with id: " + submissionRequest.getProblemId()));
+            
+            User user = userRepository.findById(submissionRequest.getUserId())
+                    .orElseThrow(() -> new IllegalArgumentException("User not found with id: " + submissionRequest.getUserId()));
+            
+            Submission submission = new Submission();
+            submission.setCode(submissionRequest.getCode());
+            submission.setLanguage(submissionRequest.getLanguage());
+            submission.setProblem(problem);
+            submission.setUser(user);
+            submission.setSubmissionTime(LocalDateTime.now());
+            submission.setStatus("PENDING"); 
+            submission.setRuntimeMs(0L);
+            submission.setTotalTestCases(0);
+            submission.setPassedTestCases(0);
+
+            Submission savedSubmission = submissionRepository.save(submission);
+
+            // Start asynchronous AI evaluation
+            CompletableFuture.runAsync(() -> {
+                try {
+                    evaluateSubmissionWithAI(savedSubmission);
+                } catch (Exception e) {
+                    savedSubmission.setStatus("ERROR");
+                    savedSubmission.setFeedback("AI evaluation failed: " + e.getMessage());
+                    submissionRepository.save(savedSubmission);
+                }
+            });
+
+            return ResponseEntity.ok(savedSubmission);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("An error occurred during submission: " + e.getMessage());
+        }
+    }
+
+    @Transactional(readOnly = false)
+    private void evaluateSubmissionWithAI(Submission submission) {
+        if (submission.getProblem() == null) {
+            throw new IllegalStateException("Submission must have a problem associated");
+        }
+        
+        List<TestCase> testCases = testCaseRepository.findByProblemId(submission.getProblem().getId());
+        
+        if (testCases.isEmpty()) {
+            throw new IllegalStateException("No test cases found for problem: " + submission.getProblem().getId());
+        }
+        
+        // Build the prompt for AI evaluation
+        StringBuilder promptBuilder = new StringBuilder();
+        promptBuilder.append("You are an expert code evaluator. Please evaluate the following code for the given problem.\n\n");
+        promptBuilder.append("Problem: ").append(submission.getProblem().getDescription()).append("\n\n");
+        promptBuilder.append("Code:\n```").append(submission.getLanguage()).append("\n").append(submission.getCode()).append("\n```\n\n");
+        promptBuilder.append("Test Cases:\n");
+        
+        for (int i = 0; i < testCases.size(); i++) {
+            TestCase testCase = testCases.get(i);
+            promptBuilder.append(String.format("Test Case %d:\n", i+1));
+            promptBuilder.append("Input: ").append(testCase.getInput()).append("\n");
+            promptBuilder.append("Expected Output: ").append(testCase.getExpectedOutput()).append("\n\n");
+        }
+        
+        promptBuilder.append("Please provide:\n");
+        promptBuilder.append("1. A brief summary of what the code does\n");
+        promptBuilder.append("2. Analysis of the approach and algorithm used\n");
+        promptBuilder.append("3. Time and space complexity analysis\n");
+        promptBuilder.append("4. For each test case, predict whether the code would pass or fail and explain why\n");
+        promptBuilder.append("5. Potential bugs or issues\n");
+        promptBuilder.append("6. Suggestions for improvement\n");
+        promptBuilder.append("7. Overall assessment of the code quality and a final verdict (PASS/FAIL) for the entire problem\n");
+        
+        String aiResponse = geminiService.getExplanation(promptBuilder.toString());
+        
+        // Parse the AI response to extract test case results
+        List<SubmissionTestCaseResult> testCaseResults = parseTestCaseResultsFromAIResponse(aiResponse, testCases, submission);
+        
+        // Calculate passed and total test cases
+        int passedCount = (int) testCaseResults.stream().filter(SubmissionTestCaseResult::isPassed).count();
+        int totalCount = testCaseResults.size();
+        
+        // Update submission with AI evaluation and test case results
+        submission.setStatus(passedCount == totalCount ? "PASSED" : "FAILED");
+        submission.setFeedback(aiResponse);
+        submission.setPassedTestCases(passedCount);
+        submission.setTotalTestCases(totalCount);
+        submission.setRuntimeMs(0L);
+        
+        // Save test case results
+        submission.setTestCaseResults(testCaseResults);
+        
+        // Also store as JSON for easier retrieval
+        try {
+            String json = objectMapper.writeValueAsString(testCaseResults);
+            submission.setTestCaseResultsJson(json);
+        } catch (JsonProcessingException e) {
+            // Log error but continue
+            e.printStackTrace();
+        }
+        
+        submissionRepository.save(submission);
+    }
+    
+    private List<SubmissionTestCaseResult> parseTestCaseResultsFromAIResponse(String aiResponse, List<TestCase> testCases, Submission submission) {
+        List<SubmissionTestCaseResult> results = new ArrayList<>();
+        
+        // Simple parsing logic - in a real implementation, this would be more sophisticated
+        // This is a basic approach that looks for patterns in the AI response
+        
+        // For each test case, try to determine if it passed based on the AI response
+        for (int i = 0; i < testCases.size(); i++) {
+            TestCase testCase = testCases.get(i);
+            SubmissionTestCaseResult result = new SubmissionTestCaseResult();
+            result.setSubmission(submission);
+            result.setTestCase(testCase);
+            
+            // Look for mentions of this test case in the AI response
+            String testCasePattern = "Test Case " + (i+1) + ":";
+            int testCaseIndex = aiResponse.indexOf(testCasePattern);
+            
+            if (testCaseIndex != -1) {
+                // Find the next section or end of response
+                int nextSectionIndex = aiResponse.indexOf("Test Case " + (i+2) + ":", testCaseIndex);
+                if (nextSectionIndex == -1) {
+                    nextSectionIndex = aiResponse.length();
+                }
+                
+                String testCaseSection = aiResponse.substring(testCaseIndex, nextSectionIndex);
+                
+                // Check if the AI indicated this test case passed
+                boolean passed = testCaseSection.toLowerCase().contains("pass") && 
+                                !testCaseSection.toLowerCase().contains("fail");
+                
+                result.setPassed(passed);
+                
+                // Try to extract actual output if mentioned
+                String actualOutputPattern = "actual output[:\\s]+([^\n]+)";
+                java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(actualOutputPattern, java.util.regex.Pattern.CASE_INSENSITIVE);
+                java.util.regex.Matcher matcher = pattern.matcher(testCaseSection);
+                
+                if (matcher.find()) {
+                    result.setActualOutput(matcher.group(1).trim());
+                } else {
+                    // If no actual output found, use a placeholder
+                    result.setActualOutput("No output provided by AI");
+                }
+                
+                result.setRuntimeMs(0L); // AI doesn't provide runtime
+                result.setError(null); // No error for now
+            } else {
+                // If no specific mention, assume it failed
+                result.setPassed(false);
+                result.setActualOutput("No evaluation provided by AI");
+                result.setRuntimeMs(0L);
+                result.setError(null);
+            }
+            
+            results.add(result);
+        }
+        
+        return results;
+    }
+
+    @PostMapping("/review")
+    @Transactional(readOnly = false)
+    public ResponseEntity<?> reviewCode(@RequestBody SubmissionRequestDTO submissionRequest) {
+        try {
+            if (submissionRequest.getCode() == null || submissionRequest.getCode().trim().isEmpty()) {
+                return ResponseEntity.badRequest().body("Code cannot be empty");
+            }
+            
+            if (submissionRequest.getProblemId() == null) {
+                return ResponseEntity.badRequest().body("Problem ID is required");
+            }
+            
+            Problem problem = problemRepository.findById(submissionRequest.getProblemId())
+                    .orElseThrow(() -> new IllegalArgumentException("Problem not found with id: " + submissionRequest.getProblemId()));
+            
+            // Generate AI review and explanation
+            String prompt = String.format(
+                "You are a code reviewer. Analyze the following code for the given problem and provide a detailed review.\n\n" +
+                "Problem: %s\n\n" +
+                "Code:\n```%s\n%s\n```\n\n" +
+                "Please provide:\n" +
+                "1. A brief summary of what the code does\n" +
+                "2. Analysis of the approach and algorithm used\n" +
+                "3. Time and space complexity analysis\n" +
+                "4. Potential bugs or issues\n" +
+                "5. Suggestions for improvement\n" +
+                "6. Overall assessment of the code quality",
+                problem.getDescription(),
+                submissionRequest.getLanguage(),
+                submissionRequest.getCode()
+            );
+            
+            String aiResponse = geminiService.getExplanation(prompt);
+            
+            return ResponseEntity.ok(aiResponse);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("An error occurred during code review: " + e.getMessage());
+        }
+    }
+
+    @GetMapping
+    public ResponseEntity<List<SubmissionDetailsDTO>> getAllSubmissions() {
+        try {
+            List<Submission> submissions = submissionRepository.findAll();
+            List<SubmissionDetailsDTO> dtos = submissions.stream()
+                    .map(this::convertToSubmissionDetailsDTO)
+                    .collect(Collectors.toList());
+            return ResponseEntity.ok(dtos);
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(null);
+        }
+    }
+
+    @GetMapping("/user/{userId}")
+    public ResponseEntity<List<SubmissionDetailsDTO>> getSubmissionsByUser(@PathVariable Long userId) {
+        try {
+            List<Submission> submissions = submissionRepository.findByUserId(userId);
+            List<SubmissionDetailsDTO> dtos = submissions.stream()
+                    .map(this::convertToSubmissionDetailsDTO)
+                    .collect(Collectors.toList());
+            return ResponseEntity.ok(dtos);
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(null);
+        }
+    }
+
+    @GetMapping("/problem/{problemId}")
+    public ResponseEntity<List<SubmissionDetailsDTO>> getSubmissionsByProblem(@PathVariable Long problemId) {
+        try {
+            List<Submission> submissions = submissionRepository.findByProblemId(problemId);
+            List<SubmissionDetailsDTO> dtos = submissions.stream()
+                    .map(this::convertToSubmissionDetailsDTO)
+                    .collect(Collectors.toList());
+            return ResponseEntity.ok(dtos);
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(null);
+        }
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<SubmissionDetailsDTO> getSubmissionById(@PathVariable Long id) {
+        try {
+            return submissionRepository.findById(id)
+                    .map(submission -> ResponseEntity.ok(convertToSubmissionDetailsDTO(submission)))
+                    .orElse(ResponseEntity.notFound().build());
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(null);
+        }
+    }
+
+    private SubmissionDetailsDTO convertToSubmissionDetailsDTO(Submission submission) {
+        SubmissionDetailsDTO dto = new SubmissionDetailsDTO();
+        dto.setId(submission.getId());
+        dto.setUserId(submission.getUser().getId());
+        dto.setUserName(submission.getUser().getName());
+        dto.setProblemId(submission.getProblem().getId());
+        dto.setProblemTitle(submission.getProblem().getTitle());
+        dto.setCode(submission.getCode());
+        dto.setLanguage(submission.getLanguage());
+        dto.setStatus(submission.getStatus());
+        dto.setRuntimeMs(submission.getRuntimeMs());
+        dto.setSubmissionTime(submission.getSubmissionTime());
+        dto.setFeedback(submission.getFeedback());
+        
+        int total = Optional.ofNullable(submission.getTotalTestCases()).orElse(0);
+        int passed = Optional.ofNullable(submission.getPassedTestCases()).orElse(0);
+        dto.setTotalTestCases(total);
+        dto.setPassedTestCases(passed);
+        dto.setFailedTestCases(Math.max(0, total - passed));       
+        
+        // Convert test case results to DTOs
+        if (submission.getTestCaseResults() != null && !submission.getTestCaseResults().isEmpty()) {
+            List<TestCaseResultDTO> testCaseResultDTOs = submission.getTestCaseResults().stream()
+                .map(result -> {
+                    TestCaseResultDTO resultDTO = new TestCaseResultDTO();
+                    resultDTO.setTestCaseId(result.getTestCase().getId());
+                    resultDTO.setInput(result.getTestCase().getInput());
+                    resultDTO.setExpectedOutput(result.getTestCase().getExpectedOutput());
+                    resultDTO.setActualOutput(result.getActualOutput());
+                    resultDTO.setPassed(result.isPassed());
+                    resultDTO.setRuntimeMs(result.getRuntimeMs());
+                    resultDTO.setError(result.getError());
+                    return resultDTO;
+                })
+                .collect(Collectors.toList());
+            dto.setTestCaseResults(testCaseResultDTOs);
+        } else if (submission.getTestCaseResultsJson() != null && !submission.getTestCaseResultsJson().isEmpty()) {
+            // Fallback to JSON if the relationship isn't loaded
+            try {
+                List<SubmissionTestCaseResult> results = objectMapper.readValue(
+                    submission.getTestCaseResultsJson(), 
+                    new TypeReference<List<SubmissionTestCaseResult>>() {}
+                );
+                
+                List<TestCaseResultDTO> testCaseResultDTOs = results.stream()
+                    .map(result -> {
+                        TestCaseResultDTO resultDTO = new TestCaseResultDTO();
+                        resultDTO.setTestCaseId(result.getTestCase().getId());
+                        resultDTO.setInput(result.getTestCase().getInput());
+                        resultDTO.setExpectedOutput(result.getTestCase().getExpectedOutput());
+                        resultDTO.setActualOutput(result.getActualOutput());
+                        resultDTO.setPassed(result.isPassed());
+                        resultDTO.setRuntimeMs(result.getRuntimeMs());
+                        resultDTO.setError(result.getError());
+                        return resultDTO;
+                    })
+                    .collect(Collectors.toList());
+                dto.setTestCaseResults(testCaseResultDTOs);
+            } catch (JsonProcessingException e) {
+                e.printStackTrace();
+            }
+        }
+        
+        return dto;
+    }
+}
