@@ -13,6 +13,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
+import java.net.URI;
+import java.net.URISyntaxException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.client.HttpClientErrorException;
 
@@ -75,8 +77,9 @@ public class Judge0Service {
 
             HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
 
-            // ✅ FIX 2: Use correct URL with /api prefix
-            String submitUrl = judge0BaseUrl + "?base64_encoded=false&wait=true";
+            // Normalize provided judge0BaseUrl and build API submit URL
+            String apiBase = getApiBase();
+            String submitUrl = apiBase + "/api/submissions?base64_encoded=false&wait=true";
 
             // ✅ FIX 3: Parse as String first to handle response structure correctly
             ResponseEntity<String> response = restTemplate.exchange(
@@ -121,8 +124,9 @@ public class Judge0Service {
 
             apiCallCount++;
 
-            // ✅ FIX 5: Use correct batch URL with /api prefix
-            String batchUrl = judge0BaseUrl.replace("/submissions", "") + "/api/submissions/batch?base64_encoded=false";
+            // Normalize provided judge0BaseUrl and build batch URL
+            String apiBase = getApiBase();
+            String batchUrl = apiBase + "/api/submissions/batch?base64_encoded=false";
             try {
                 ResponseEntity<String> response = restTemplate.exchange(
                         batchUrl,
@@ -177,8 +181,9 @@ public class Judge0Service {
                     headers.set("X-Auth-Token", suluApiKey);
                 }
                 
-                // ✅ FIX 5: Use correct batch URL with /api prefix
-                String batchUrl = judge0BaseUrl.replace("/submissions", "") + "/api/submissions/batch";
+                // Normalize provided judge0BaseUrl and build batch URL
+                String apiBase = getApiBase();
+                String batchUrl = apiBase + "/api/submissions/batch";
                 
                 ResponseEntity<String> response = restTemplate.exchange(
                         batchUrl + "?tokens=" + String.join(",", tokens) + "&base64_encoded=false",
@@ -247,6 +252,36 @@ public class Judge0Service {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    /**
+     * Normalize the configured Judge0 URL to the API base (scheme://host[:port]).
+     * This allows users to set JUDGE0_API_URL with or without paths like /submissions
+     * and the service will still build proper /api/... endpoints.
+     */
+    private String getApiBase() {
+        try {
+            if (judge0BaseUrl == null || judge0BaseUrl.trim().isEmpty()) {
+                throw new IllegalStateException("judge0.api.url is not configured");
+            }
+            URI uri = new URI(judge0BaseUrl.trim());
+            String scheme = uri.getScheme() != null ? uri.getScheme() : "https";
+            String host = uri.getHost();
+            int port = uri.getPort();
+            StringBuilder sb = new StringBuilder();
+            sb.append(scheme).append("://").append(host);
+            if (port != -1) sb.append(":").append(port);
+            return sb.toString();
+        } catch (URISyntaxException e) {
+            // If parsing fails, attempt a best-effort cleanup
+            String cleaned = judge0BaseUrl.replaceAll("/+$", "");
+            // remove path portion if present
+            int idx = cleaned.indexOf("/");
+            if (idx > 8) { // after https://
+                cleaned = cleaned.substring(0, idx);
+            }
+            return cleaned;
         }
     }
 
