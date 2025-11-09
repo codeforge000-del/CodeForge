@@ -14,6 +14,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.client.HttpClientErrorException;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -121,22 +122,44 @@ public class Judge0Service {
             apiCallCount++;
 
             // ✅ FIX 5: Use correct batch URL with /api prefix
-            ResponseEntity<String> response = restTemplate.exchange(
-                    judge0BaseUrl.replace("/submissions", "") + "/api/submissions/batch?base64_encoded=false",
-                    HttpMethod.POST,
-                    request,
-                    String.class
-            );
+            String batchUrl = judge0BaseUrl.replace("/submissions", "") + "/api/submissions/batch?base64_encoded=false";
+            try {
+                ResponseEntity<String> response = restTemplate.exchange(
+                        batchUrl,
+                        HttpMethod.POST,
+                        request,
+                        String.class
+                );
 
-            // Fixed: Accept both 200 (OK) and 201 (CREATED) as valid responses
-            if ((response.getStatusCode() != HttpStatus.OK && 
-                 response.getStatusCode() != HttpStatus.CREATED) || 
-                 response.getBody() == null) {
-                throw new RuntimeException("Failed to submit batch: " + response.getStatusCode());
+                // Fixed: Accept both 200 (OK) and 201 (CREATED) as valid responses
+                if ((response.getStatusCode() != HttpStatus.OK && 
+                     response.getStatusCode() != HttpStatus.CREATED) || 
+                     response.getBody() == null) {
+                    throw new RuntimeException("Failed to submit batch: " + response.getStatusCode());
+                }
+
+                // ✅ FIX 4: Safely map JSON to our DTO
+                return objectMapper.readValue(response.getBody(), Judge0BatchResponse.class);
+            } catch (HttpClientErrorException.NotFound notFound) {
+                // Endpoint not found -> fall back to submitting individually using executeCode
+                System.err.println("Batch endpoint not found (404). Falling back to individual submissions.");
+                Judge0BatchResponse fallback = new Judge0BatchResponse();
+                List<Judge0Response> responses = new ArrayList<>();
+                for (Judge0BatchSubmissionRequest reqBody : submissions) {
+                    try {
+                        Judge0Response single = executeCode(reqBody.getSource_code(), reqBody.getLanguage_id(), reqBody.getStdin());
+                        responses.add(single);
+                    } catch (Exception e) {
+                        // Create a minimal failed response when executeCode fails
+                        Judge0Response failed = new Judge0Response();
+                        failed.setStdout(null);
+                        failed.setStderr(e.getMessage());
+                        responses.add(failed);
+                    }
+                }
+                fallback.setSubmissions(responses);
+                return fallback;
             }
-
-            // ✅ FIX 4: Safely map JSON to our DTO
-            return objectMapper.readValue(response.getBody(), Judge0BatchResponse.class);
         } catch (Exception e) {
             e.printStackTrace();
             throw new Exception("Failed to submit batch: " + e.getMessage());
