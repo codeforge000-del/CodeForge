@@ -1,0 +1,15 @@
+# Maven / Java
+target/
+*.class
+
+# IDE
+.classpath
+.project
+.settings/
+.vscode/
+
+# OS
+.DS_Store
+
+# Local application properties with secrets
+LeetAI/src/main/resources/application-local.properties

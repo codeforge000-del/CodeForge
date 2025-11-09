@@ -13,7 +13,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
+import java.net.URI;
+import java.net.URISyntaxException;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.client.HttpClientErrorException;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -74,8 +77,9 @@ public class Judge0Service {
 
             HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
 
-            // ✅ FIX 2: Use correct URL with /api prefix
-            String submitUrl = judge0BaseUrl + "?base64_encoded=false&wait=true";
+            // Normalize provided judge0BaseUrl and build API submit URL
+            String apiBase = getApiBase();
+            String submitUrl = apiBase + "/api/submissions?base64_encoded=false&wait=true";
 
             // ✅ FIX 3: Parse as String first to handle response structure correctly
             ResponseEntity<String> response = restTemplate.exchange(
@@ -120,23 +124,46 @@ public class Judge0Service {
 
             apiCallCount++;
 
-            // ✅ FIX 5: Use correct batch URL with /api prefix
-            ResponseEntity<String> response = restTemplate.exchange(
-                    judge0BaseUrl.replace("/submissions", "") + "/api/submissions/batch?base64_encoded=false",
-                    HttpMethod.POST,
-                    request,
-                    String.class
-            );
+            // Normalize provided judge0BaseUrl and build batch URL
+            String apiBase = getApiBase();
+            String batchUrl = apiBase + "/api/submissions/batch?base64_encoded=false";
+            try {
+                ResponseEntity<String> response = restTemplate.exchange(
+                        batchUrl,
+                        HttpMethod.POST,
+                        request,
+                        String.class
+                );
 
-            // Fixed: Accept both 200 (OK) and 201 (CREATED) as valid responses
-            if ((response.getStatusCode() != HttpStatus.OK && 
-                 response.getStatusCode() != HttpStatus.CREATED) || 
-                 response.getBody() == null) {
-                throw new RuntimeException("Failed to submit batch: " + response.getStatusCode());
+                // Fixed: Accept both 200 (OK) and 201 (CREATED) as valid responses
+                if ((response.getStatusCode() != HttpStatus.OK && 
+                     response.getStatusCode() != HttpStatus.CREATED) || 
+                     response.getBody() == null) {
+                    throw new RuntimeException("Failed to submit batch: " + response.getStatusCode());
+                }
+
+                // ✅ FIX 4: Safely map JSON to our DTO
+                return objectMapper.readValue(response.getBody(), Judge0BatchResponse.class);
+            } catch (HttpClientErrorException.NotFound notFound) {
+                // Endpoint not found -> fall back to submitting individually using executeCode
+                System.err.println("Batch endpoint not found (404). Falling back to individual submissions.");
+                Judge0BatchResponse fallback = new Judge0BatchResponse();
+                List<Judge0Response> responses = new ArrayList<>();
+                for (Judge0BatchSubmissionRequest reqBody : submissions) {
+                    try {
+                        Judge0Response single = executeCode(reqBody.getSource_code(), reqBody.getLanguage_id(), reqBody.getStdin());
+                        responses.add(single);
+                    } catch (Exception e) {
+                        // Create a minimal failed response when executeCode fails
+                        Judge0Response failed = new Judge0Response();
+                        failed.setStdout(null);
+                        failed.setStderr(e.getMessage());
+                        responses.add(failed);
+                    }
+                }
+                fallback.setSubmissions(responses);
+                return fallback;
             }
-
-            // ✅ FIX 4: Safely map JSON to our DTO
-            return objectMapper.readValue(response.getBody(), Judge0BatchResponse.class);
         } catch (Exception e) {
             e.printStackTrace();
             throw new Exception("Failed to submit batch: " + e.getMessage());
@@ -154,8 +181,9 @@ public class Judge0Service {
                     headers.set("X-Auth-Token", suluApiKey);
                 }
                 
-                // ✅ FIX 5: Use correct batch URL with /api prefix
-                String batchUrl = judge0BaseUrl.replace("/submissions", "") + "/api/submissions/batch";
+                // Normalize provided judge0BaseUrl and build batch URL
+                String apiBase = getApiBase();
+                String batchUrl = apiBase + "/api/submissions/batch";
                 
                 ResponseEntity<String> response = restTemplate.exchange(
                         batchUrl + "?tokens=" + String.join(",", tokens) + "&base64_encoded=false",
@@ -224,6 +252,36 @@ public class Judge0Service {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    /**
+     * Normalize the configured Judge0 URL to the API base (scheme://host[:port]).
+     * This allows users to set JUDGE0_API_URL with or without paths like /submissions
+     * and the service will still build proper /api/... endpoints.
+     */
+    private String getApiBase() {
+        try {
+            if (judge0BaseUrl == null || judge0BaseUrl.trim().isEmpty()) {
+                throw new IllegalStateException("judge0.api.url is not configured");
+            }
+            URI uri = new URI(judge0BaseUrl.trim());
+            String scheme = uri.getScheme() != null ? uri.getScheme() : "https";
+            String host = uri.getHost();
+            int port = uri.getPort();
+            StringBuilder sb = new StringBuilder();
+            sb.append(scheme).append("://").append(host);
+            if (port != -1) sb.append(":").append(port);
+            return sb.toString();
+        } catch (URISyntaxException e) {
+            // If parsing fails, attempt a best-effort cleanup
+            String cleaned = judge0BaseUrl.replaceAll("/+$", "");
+            // remove path portion if present
+            int idx = cleaned.indexOf("/");
+            if (idx > 8) { // after https://
+                cleaned = cleaned.substring(0, idx);
+            }
+            return cleaned;
         }
     }
 
