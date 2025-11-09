@@ -8,6 +8,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
@@ -35,6 +36,10 @@ import SD_Tech.LeetAI.Repository.SubmissionRepository;
 import SD_Tech.LeetAI.Repository.TestCaseRepository;
 import SD_Tech.LeetAI.Repository.UserRepository;
 import SD_Tech.LeetAI.Service.GeminiService;
+import SD_Tech.LeetAI.Service.Judge0Service;
+import SD_Tech.LeetAI.DTO.Judge0BatchSubmissionRequest;
+import SD_Tech.LeetAI.DTO.Judge0Response;
+import SD_Tech.LeetAI.DTO.Judge0BatchResponse;
 
 @RestController
 @RequestMapping("/api/submissions")
@@ -51,10 +56,16 @@ public class SubmissionController {
     private GeminiService geminiService;
     
     @Autowired
+    private Judge0Service judge0Service;
+    
+    @Autowired
     private ProblemRepository problemRepository;
     
     @Autowired
     private UserRepository userRepository;
+    
+    @Value("${app.demo.mock:false}")
+    private boolean appDemoMock;
     
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -119,65 +130,171 @@ public class SubmissionController {
         if (submission.getProblem() == null) {
             throw new IllegalStateException("Submission must have a problem associated");
         }
-        
+
         List<TestCase> testCases = testCaseRepository.findByProblemId(submission.getProblem().getId());
-        
+
         if (testCases.isEmpty()) {
             throw new IllegalStateException("No test cases found for problem: " + submission.getProblem().getId());
         }
-        
-        // Build the prompt for AI evaluation
-        StringBuilder promptBuilder = new StringBuilder();
-        promptBuilder.append("You are an expert code evaluator. Please evaluate the following code for the given problem.\n\n");
-        promptBuilder.append("Problem: ").append(submission.getProblem().getDescription()).append("\n\n");
-        promptBuilder.append("Code:\n```").append(submission.getLanguage()).append("\n").append(submission.getCode()).append("\n```\n\n");
-        promptBuilder.append("Test Cases:\n");
-        
-        for (int i = 0; i < testCases.size(); i++) {
-            TestCase testCase = testCases.get(i);
-            promptBuilder.append(String.format("Test Case %d:\n", i+1));
-            promptBuilder.append("Input: ").append(testCase.getInput()).append("\n");
-            promptBuilder.append("Expected Output: ").append(testCase.getExpectedOutput()).append("\n\n");
+
+        // Demo/mock mode: simulate Judge0 responses locally without calling external Judge0
+        if (appDemoMock) {
+            List<SubmissionTestCaseResult> simulatedResults = new ArrayList<>();
+            long totalRuntime = 0L;
+            for (TestCase tc : testCases) {
+                SubmissionTestCaseResult res = new SubmissionTestCaseResult();
+                res.setSubmission(submission);
+                res.setTestCase(tc);
+                res.setPassed(true);
+                String expected = tc.getExpectedOutput() != null ? tc.getExpectedOutput().trim() : "";
+                res.setActualOutput(expected);
+                res.setRuntimeMs(10L); // tiny simulated runtime
+                res.setError(null);
+                simulatedResults.add(res);
+                totalRuntime += res.getRuntimeMs();
+            }
+
+            int passedCount = simulatedResults.size();
+            int totalCount = simulatedResults.size();
+
+            submission.setStatus("PASSED");
+            submission.setFeedback("Demo mode: all test cases marked as passed (simulated)");
+            submission.setPassedTestCases(passedCount);
+            submission.setTotalTestCases(totalCount);
+            submission.setRuntimeMs(totalRuntime);
+            submission.setTestCaseResults(simulatedResults);
+            try {
+                List<TestCaseResultDTO> dtoList = simulatedResults.stream().map(r -> {
+                    TestCaseResultDTO d = new TestCaseResultDTO();
+                    d.setTestCaseId(r.getTestCase() != null ? r.getTestCase().getId() : null);
+                    d.setInput(r.getTestCase() != null ? r.getTestCase().getInput() : null);
+                    d.setExpectedOutput(r.getTestCase() != null ? r.getTestCase().getExpectedOutput() : null);
+                    d.setActualOutput(r.getActualOutput());
+                    d.setPassed(r.isPassed());
+                    d.setRuntimeMs(r.getRuntimeMs());
+                    d.setError(r.getError());
+                    return d;
+                }).collect(Collectors.toList());
+
+                submission.setTestCaseResultsJson(objectMapper.writeValueAsString(dtoList));
+            } catch (JsonProcessingException e) {
+                e.printStackTrace();
+            }
+            submissionRepository.save(submission);
+            return;
         }
-        
-        promptBuilder.append("Please provide:\n");
-        promptBuilder.append("1. A brief summary of what the code does\n");
-        promptBuilder.append("2. Analysis of the approach and algorithm used\n");
-        promptBuilder.append("3. Time and space complexity analysis\n");
-        promptBuilder.append("4. For each test case, predict whether the code would pass or fail and explain why\n");
-        promptBuilder.append("5. Potential bugs or issues\n");
-        promptBuilder.append("6. Suggestions for improvement\n");
-        promptBuilder.append("7. Overall assessment of the code quality and a final verdict (PASS/FAIL) for the entire problem\n");
-        
-        String aiResponse = geminiService.getExplanation(promptBuilder.toString());
-        
-        // Parse the AI response to extract test case results
-        List<SubmissionTestCaseResult> testCaseResults = parseTestCaseResultsFromAIResponse(aiResponse, testCases, submission);
-        
-        // Calculate passed and total test cases
-        int passedCount = (int) testCaseResults.stream().filter(SubmissionTestCaseResult::isPassed).count();
-        int totalCount = testCaseResults.size();
-        
-        // Update submission with AI evaluation and test case results
-        submission.setStatus(passedCount == totalCount ? "PASSED" : "FAILED");
-        submission.setFeedback(aiResponse);
-        submission.setPassedTestCases(passedCount);
-        submission.setTotalTestCases(totalCount);
-        submission.setRuntimeMs(0L);
-        
-        // Save test case results
-        submission.setTestCaseResults(testCaseResults);
-        
-        // Also store as JSON for easier retrieval
+
         try {
-            String json = objectMapper.writeValueAsString(testCaseResults);
-            submission.setTestCaseResultsJson(json);
-        } catch (JsonProcessingException e) {
-            // Log error but continue
-            e.printStackTrace();
+            // Prepare batch requests for Judge0
+            int languageId = judge0Service.getLanguageId(submission.getLanguage());
+
+            List<Judge0BatchSubmissionRequest> batchRequests = new ArrayList<>();
+            for (TestCase tc : testCases) {
+                Judge0BatchSubmissionRequest req = new Judge0BatchSubmissionRequest(String.valueOf(languageId), submission.getCode(), tc.getInput());
+                req.setExpected_output(tc.getExpectedOutput());
+                batchRequests.add(req);
+            }
+
+            // Submit batch and poll for results
+            Judge0BatchResponse batchResponse = judge0Service.submitBatch(batchRequests);
+
+            List<String> tokens = new ArrayList<>();
+            if (batchResponse != null && batchResponse.getSubmissions() != null) {
+                for (Judge0Response r : batchResponse.getSubmissions()) {
+                    if (r != null && r.getToken() != null) tokens.add(r.getToken());
+                }
+            }
+
+            List<Judge0Response> results = judge0Service.pollBatchResults(tokens);
+
+            // Map results back to test case results
+            List<SubmissionTestCaseResult> testCaseResults = new ArrayList<>();
+            int idx = 0;
+            long totalRuntime = 0L;
+            for (Judge0Response jr : results) {
+                SubmissionTestCaseResult res = new SubmissionTestCaseResult();
+                res.setSubmission(submission);
+                TestCase tc = testCases.get(Math.min(idx, testCases.size() - 1));
+                res.setTestCase(tc);
+
+                boolean passed = jr.getStatus() != null && jr.getStatus().getId() == 3; // 3 == Accepted
+                res.setPassed(passed);
+
+                String actualOutput = jr.getStdout();
+                if ((actualOutput == null || actualOutput.isEmpty()) && jr.getStderr() != null) {
+                    actualOutput = jr.getStderr();
+                }
+                if ((actualOutput == null || actualOutput.isEmpty()) && jr.getCompile_output() != null) {
+                    actualOutput = jr.getCompile_output();
+                }
+                res.setActualOutput(actualOutput != null ? actualOutput.trim() : "");
+
+                res.setRuntimeMs(jr.getTime());
+                totalRuntime += jr.getTime();
+
+                // Set error details when appropriate
+                if (jr.getStatus() != null && jr.getStatus().getId() == 6) { // Compilation error
+                    res.setError(jr.getCompile_output());
+                } else if (jr.getStatus() != null && jr.getStatus().getId() != 3) {
+                    // Non-accepted and non-compilation statuses
+                    res.setError(jr.getStderr() != null ? jr.getStderr() : null);
+                } else {
+                    res.setError(null);
+                }
+
+                testCaseResults.add(res);
+                idx++;
+            }
+
+            int passedCount = (int) testCaseResults.stream().filter(SubmissionTestCaseResult::isPassed).count();
+            int totalCount = testCaseResults.size();
+
+            submission.setStatus(passedCount == totalCount ? "PASSED" : "FAILED");
+            // Build a concise feedback summary
+            StringBuilder feedback = new StringBuilder();
+            feedback.append("Judge0 evaluation results:\n");
+            for (int i = 0; i < testCaseResults.size(); i++) {
+                SubmissionTestCaseResult r = testCaseResults.get(i);
+                feedback.append(String.format("Test %d: %s\n", i + 1, r.isPassed() ? "PASS" : "FAIL"));
+                if (r.getError() != null && !r.getError().isEmpty()) {
+                    feedback.append("Error: ").append(r.getError()).append("\n");
+                }
+            }
+
+            submission.setFeedback(feedback.toString());
+            submission.setPassedTestCases(passedCount);
+            submission.setTotalTestCases(totalCount);
+            submission.setRuntimeMs(totalRuntime);
+
+            submission.setTestCaseResults(testCaseResults);
+
+            try {
+                // Serialize a lightweight DTO list instead of full entities to avoid
+                // jackson problems with LocalDateTime and circular references.
+                List<TestCaseResultDTO> dtoList = testCaseResults.stream().map(r -> {
+                    TestCaseResultDTO d = new TestCaseResultDTO();
+                    d.setTestCaseId(r.getTestCase() != null ? r.getTestCase().getId() : null);
+                    d.setInput(r.getTestCase() != null ? r.getTestCase().getInput() : null);
+                    d.setExpectedOutput(r.getTestCase() != null ? r.getTestCase().getExpectedOutput() : null);
+                    d.setActualOutput(r.getActualOutput());
+                    d.setPassed(r.isPassed());
+                    d.setRuntimeMs(r.getRuntimeMs());
+                    d.setError(r.getError());
+                    return d;
+                }).collect(Collectors.toList());
+
+                submission.setTestCaseResultsJson(objectMapper.writeValueAsString(dtoList));
+            } catch (JsonProcessingException e) {
+                e.printStackTrace();
+            }
+
+            submissionRepository.save(submission);
+        } catch (Exception e) {
+            // If Judge0 fails, persist an error state and include message
+            submission.setStatus("ERROR");
+            submission.setFeedback("Judge0 evaluation failed: " + e.getMessage());
+            submissionRepository.save(submission);
         }
-        
-        submissionRepository.save(submission);
     }
     
     private List<SubmissionTestCaseResult> parseTestCaseResultsFromAIResponse(String aiResponse, List<TestCase> testCases, Submission submission) {
@@ -377,24 +494,11 @@ public class SubmissionController {
         } else if (submission.getTestCaseResultsJson() != null && !submission.getTestCaseResultsJson().isEmpty()) {
             // Fallback to JSON if the relationship isn't loaded
             try {
-                List<SubmissionTestCaseResult> results = objectMapper.readValue(
+                // Our stored JSON is a list of TestCaseResultDTO (lightweight), try to read that first
+                List<TestCaseResultDTO> testCaseResultDTOs = objectMapper.readValue(
                     submission.getTestCaseResultsJson(), 
-                    new TypeReference<List<SubmissionTestCaseResult>>() {}
+                    new TypeReference<List<TestCaseResultDTO>>() {}
                 );
-                
-                List<TestCaseResultDTO> testCaseResultDTOs = results.stream()
-                    .map(result -> {
-                        TestCaseResultDTO resultDTO = new TestCaseResultDTO();
-                        resultDTO.setTestCaseId(result.getTestCase().getId());
-                        resultDTO.setInput(result.getTestCase().getInput());
-                        resultDTO.setExpectedOutput(result.getTestCase().getExpectedOutput());
-                        resultDTO.setActualOutput(result.getActualOutput());
-                        resultDTO.setPassed(result.isPassed());
-                        resultDTO.setRuntimeMs(result.getRuntimeMs());
-                        resultDTO.setError(result.getError());
-                        return resultDTO;
-                    })
-                    .collect(Collectors.toList());
                 dto.setTestCaseResults(testCaseResultDTOs);
             } catch (JsonProcessingException e) {
                 e.printStackTrace();

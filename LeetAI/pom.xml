@@ -68,6 +68,13 @@
             <version>${postgresql.version}</version>
         </dependency>
 
+        <!-- H2 for local demo / in-memory DB -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
         <!-- JWT -->
         <dependency>
             <groupId>io.jsonwebtoken</groupId>
